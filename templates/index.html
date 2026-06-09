@@ -1,0 +1,158 @@
+<!-- templates/index.html -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ARIA — AI Agent Dashboard</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Space+Mono:ital,wght@0,400;0,700;1,400&family=DM+Sans:wght@300;400;500;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/css/style.css" />
+</head>
+<body>
+
+<!-- ── Top Bar ─────────────────────────────────────────────── -->
+<header class="topbar">
+  <div class="topbar-left">
+    <span class="logo">ARIA</span>
+    <span class="logo-sub">AI Agent Dashboard</span>
+  </div>
+  <div class="topbar-center">
+    <span id="live-date" class="live-date">—</span>
+  </div>
+  <div class="topbar-right">
+    <span id="live-time" class="live-time mono">00:00:00</span>
+    <span class="status-dot" title="Live"></span>
+  </div>
+</header>
+
+<!-- ── Main Grid ───────────────────────────────────────────── -->
+<main class="dashboard-grid">
+
+  <!-- Weather Widget -->
+  <section class="card card--weather" id="weather-card">
+    <div class="card-header">
+      <span class="card-label">WEATHER</span>
+      <div class="card-controls">
+        <input id="weather-city-input" class="city-input" type="text" placeholder="City…" value="Kochi" />
+        <button class="icon-btn" onclick="loadWeather()" title="Refresh">↻</button>
+      </div>
+    </div>
+    <div class="card-body" id="weather-body">
+      <div class="skeleton-block"></div>
+    </div>
+  </section>
+
+  <!-- Crypto Tracker -->
+  <section class="card card--crypto" id="crypto-card">
+    <div class="card-header">
+      <span class="card-label">CRYPTO</span>
+      <button class="icon-btn" onclick="loadCrypto()" title="Refresh">↻</button>
+    </div>
+    <div class="card-body" id="crypto-body">
+      <div class="skeleton-block"></div>
+    </div>
+  </section>
+
+  <!-- News Feed -->
+  <section class="card card--news" id="news-card">
+    <div class="card-header">
+      <span class="card-label">NEWS</span>
+      <div class="card-controls">
+        <input id="news-query-input" class="city-input" type="text" placeholder="Topic…" value="technology" />
+        <button class="icon-btn" onclick="loadNews()" title="Refresh">↻</button>
+      </div>
+    </div>
+    <div class="card-body" id="news-body">
+      <div class="skeleton-block"></div>
+    </div>
+  </section>
+
+  <!-- GitHub Activity -->
+  <section class="card card--github" id="github-card">
+    <div class="card-header">
+      <span class="card-label">GITHUB</span>
+      <div class="card-controls">
+        <input id="github-user-input" class="city-input" type="text" placeholder="Username…" />
+        <button class="icon-btn" onclick="loadGitHub()" title="Refresh">↻</button>
+      </div>
+    </div>
+    <div class="card-body" id="github-body">
+      <div class="skeleton-block"></div>
+    </div>
+  </section>
+
+  <!-- AI Agent Chat -->
+  <section class="card card--agent">
+    <div class="card-header">
+      <span class="card-label">ARIA AGENT</span>
+      <span class="agent-badge">● LIVE</span>
+    </div>
+    <div class="agent-messages" id="agent-messages">
+      <div class="msg msg--system">
+        <span class="msg-icon">◈</span>
+        <p>Hello! I'm ARIA, your AI assistant. Ask me about weather, news, crypto prices, or GitHub activity — I'll fetch real-time data for you.</p>
+      </div>
+    </div>
+    <div class="agent-input-row">
+      <input
+        id="agent-input"
+        class="agent-input"
+        type="text"
+        placeholder="Ask ARIA anything… e.g. 'What's the weather in Mumbai?'"
+        autocomplete="off"
+      />
+      <button class="send-btn" id="send-btn" onclick="sendMessage()">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+      </button>
+    </div>
+    <div class="quick-prompts">
+      <button class="quick-btn" onclick="quickPrompt('What is the current Bitcoin price?')">₿ BTC price</button>
+      <button class="quick-btn" onclick="quickPrompt('Latest news on artificial intelligence')">📰 AI news</button>
+      <button class="quick-btn" onclick="quickPrompt('Weather in London')">⛅ London weather</button>
+      <button class="quick-btn" onclick="quickPrompt('Show my GitHub activity')">🐙 My GitHub</button>
+    </div>
+  </section>
+
+  <!-- To-Do Widget -->
+  <section class="card card--todo" id="todo-widget">
+    <div class="card-header">
+      <span class="card-label">TASKS</span>
+      <div class="card-controls">
+        <span id="todo-stats" class="todo-stats-badge"></span>
+        <button class="icon-btn" id="todo-clear-btn" title="Clear completed">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v6M14 11v6M9 6V4h6v2"/></svg>
+        </button>
+      </div>
+    </div>
+
+    <!-- Add task row -->
+    <div class="todo-add-row">
+      <input id="todo-input" class="todo-input" type="text" placeholder="Add a task…" maxlength="500" />
+      <select id="todo-priority" class="todo-priority-select">
+        <option value="high">🔴</option>
+        <option value="medium" selected>🟡</option>
+        <option value="low">🟢</option>
+      </select>
+      <button class="todo-add-btn" id="todo-add-btn">+</button>
+    </div>
+
+    <!-- Filter tabs -->
+    <div class="todo-filters">
+      <button class="todo-filter active" data-filter="all">All</button>
+      <button class="todo-filter" data-filter="pending">Pending</button>
+      <button class="todo-filter" data-filter="done">Done</button>
+    </div>
+
+    <!-- Task list -->
+    <ul class="todo-list" id="todo-list">
+      <li class="todo-empty" id="todo-empty">No tasks yet — add one above.</li>
+    </ul>
+  </section>
+
+</main>
+
+<script src="/static/js/dashboard.js"></script>
+</body>
+</html>
