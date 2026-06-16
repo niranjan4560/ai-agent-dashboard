@@ -131,6 +131,59 @@ Visit [http://localhost:8000](http://localhost:8000)
 
 ---
 
+#### Quick Start (Recommended)
+
+For Windows users, the easiest way to run the project is using the included startup script.After downloading the zip file and extracting the files you will get run.bat.
+
+### Option 1: Double Click
+
+Simply double-click:
+
+```text
+run.bat
+```
+
+The script will automatically:
+
+* Load environment variables from `.env`
+* Create a Python virtual environment if one does not exist
+* Activate the virtual environment
+* Install required dependencies from `requirements.txt`
+* Start the FastAPI server
+
+### Option 2: Run from Command Prompt
+
+Open a terminal in the project folder and execute:
+
+```cmd
+run.bat
+```
+
+Once the server starts, open:
+
+```text
+http://localhost:8000
+```
+
+Swagger API Documentation:
+
+```text
+http://localhost:8000/docs
+```
+
+### Expected Output
+
+```text
+==========================================
+  ARIA - AI Agent Dashboard
+  http://localhost:8000
+==========================================
+```
+
+This is the recommended way to start the application during development because it automates the entire setup process.
+
+---
+
 ## How the AI Agent Works
 
 ARIA uses Google's Gemini Function Calling capability in an agentic execution loop:
