@@ -248,4 +248,3 @@ After deployment, users will be able to access the dashboard through a public UR
 - NewsAPI free tier only allows queries on articles up to 1 month old and has a 100 requests/day limit.
 - GitHub's unauthenticated API is limited to 60 requests/hour. Setting `GITHUB_TOKEN` raises this to 5,000/hour.
 - PostgreSQL must be running before starting the application.
-- Ollama must be running locally with the configured model downloaded before starting the application.
