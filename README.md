@@ -131,7 +131,7 @@ Visit [http://localhost:8000](http://localhost:8000)
 
 ---
 
-#### Quick Start (Recommended)
+### Quick Start (Recommended)
 
 For Windows users, the easiest way to run the project is using the included startup script.After downloading the zip file and extracting the files you will get run.bat.
 
