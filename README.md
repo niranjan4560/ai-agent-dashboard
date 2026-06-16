@@ -225,6 +225,8 @@ Any VPS supporting Python and FastAPI
 
 After deployment, users will be able to access the dashboard through a public URL without requiring local installation.
 
+---
+
 ## What I'd Improve with More Time
 
 1. **WebSocket live updates** — Push real-time price changes via WebSockets instead of polling every 5 minutes
