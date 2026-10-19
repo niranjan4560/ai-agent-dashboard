@@ -5,6 +5,9 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>ARIA — AI Agent Dashboard</title>
+  <meta name="description" content="ARIA — a live dashboard with weather, news, crypto, GitHub activity, tasks and an AI assistant." />
+  <meta name="theme-color" content="#0a0c10" />
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230a0c10'/%3E%3Cpath d='M16 6 25 26h-4l-1.8-4.5h-6.4L11 26H7z M14 18h4l-2-5z' fill='%2300d9a0'/%3E%3C/svg%3E" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Space+Mono:ital,wght@0,400;0,700;1,400&family=DM+Sans:wght@300;400;500;600&display=swap" rel="stylesheet" />
@@ -24,6 +27,11 @@
   <div class="topbar-right">
     <span id="live-time" class="live-time mono">00:00:00</span>
     <span class="status-dot" title="Live"></span>
+    <div class="account" id="account-area">
+      <span class="account-name" id="account-name" hidden></span>
+      <button class="account-btn" id="signin-btn" type="button">Sign in</button>
+      <button class="account-btn account-btn--ghost" id="signout-btn" type="button" hidden>Sign out</button>
+    </div>
   </div>
 </header>
 
@@ -84,7 +92,7 @@
   </section>
 
   <!-- AI Agent Chat -->
-  <section class="card card--agent">
+  <section class="card card--agent requires-auth">
     <div class="card-header">
       <span class="card-label">ARIA AGENT</span>
       <span class="agent-badge">● LIVE</span>
@@ -116,7 +124,7 @@
   </section>
 
   <!-- To-Do Widget -->
-  <section class="card card--todo" id="todo-widget">
+  <section class="card card--todo requires-auth" id="todo-widget">
     <div class="card-header">
       <span class="card-label">TASKS</span>
       <div class="card-controls">
@@ -149,9 +157,43 @@
     <ul class="todo-list" id="todo-list">
       <li class="todo-empty" id="todo-empty">No tasks yet — add one above.</li>
     </ul>
+    <div class="todo-error" id="todo-error" role="alert" hidden></div>
   </section>
 
 </main>
+
+<!-- ── Sign-in / Register modal ────────────────────────────── -->
+<div class="auth-overlay" id="auth-overlay" hidden>
+  <div class="auth-modal" role="dialog" aria-modal="true" aria-labelledby="auth-title">
+    <button class="auth-close" id="auth-close" type="button" aria-label="Close">×</button>
+    <div class="auth-tabs" role="tablist">
+      <button class="auth-tab active" data-mode="login" type="button" role="tab">Sign in</button>
+      <button class="auth-tab" data-mode="register" type="button" role="tab">Create account</button>
+    </div>
+    <h2 class="auth-title" id="auth-title">Sign in to ARIA</h2>
+    <form id="auth-form" novalidate>
+      <label class="auth-field" id="auth-username-field" hidden>
+        <span>Username</span>
+        <input id="auth-username" type="text" autocomplete="username" minlength="3" maxlength="50" />
+      </label>
+      <label class="auth-field">
+        <span>Email</span>
+        <input id="auth-email" type="email" autocomplete="email" maxlength="200" required />
+      </label>
+      <label class="auth-field">
+        <span>Password</span>
+        <input id="auth-password" type="password" autocomplete="current-password" minlength="8" maxlength="72" required />
+      </label>
+      <div class="auth-error" id="auth-error" role="alert" hidden></div>
+      <button class="auth-submit" id="auth-submit" type="submit">Sign in</button>
+    </form>
+    <p class="auth-note">
+      An account is needed for the ARIA chat and your task list. We store your username,
+      email, a salted password hash, your tasks and your chat messages. Weather, news,
+      crypto and GitHub widgets work without signing in.
+    </p>
+  </div>
+</div>
 
 <script src="/static/js/dashboard.js"></script>
 </body>

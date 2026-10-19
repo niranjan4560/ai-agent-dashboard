@@ -1,15 +1,13 @@
 @echo off
 REM run.bat — One-command startup for the ARIA dashboard (Windows)
 
+cd /d "%~dp0"
+
 echo.
-echo Loading environment variables...
-if exist .env (
-    for /f "tokens=1,2 delims==" %%a in (.env) do (
-        if not "%%a"=="" if not "%%a:~0,1%"=="#" set %%a=%%b
-    )
-    echo [OK] .env loaded
-) else (
-    echo [WARN] No .env file found. Copy .env.example to .env
+REM .env is loaded by the app itself (python-dotenv)
+if not exist .env (
+    echo [ERROR] No .env file found. Copy .env.example to .env and set DATABASE_URL
+    exit /b 1
 )
 
 REM Create venv if missing
@@ -32,4 +30,4 @@ echo   http://localhost:8000
 echo ==========================================
 echo.
 
-uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+uvicorn main:app --host 127.0.0.1 --port 8000 --reload

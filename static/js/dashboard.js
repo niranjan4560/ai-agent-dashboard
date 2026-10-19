@@ -28,6 +28,142 @@ function errorHTML(msg) {
   return `<div class="error-msg">⚠ ${esc(msg)}</div>`;
 }
 
+// Parse a JSON body even on error responses; fall back to a readable message.
+async function readJSON(res) {
+  try {
+    return await res.json();
+  } catch {
+    return { error: res.ok ? "Unexpected response from server" : `Server error (HTTP ${res.status})` };
+  }
+}
+
+// ─── Session / Auth ───────────────────────────────────────────────────────────
+
+const Session = {
+  get token()    { try { return localStorage.getItem("token"); } catch { return null; } },
+  get username() { try { return localStorage.getItem("username"); } catch { return null; } },
+  save(token, username) {
+    try {
+      localStorage.setItem("token", token);
+      localStorage.setItem("username", username || "");
+    } catch { /* storage blocked — session lasts until reload */ }
+    window.dispatchEvent(new Event("aria:auth"));
+  },
+  clear() {
+    try {
+      localStorage.removeItem("token");
+      localStorage.removeItem("username");
+    } catch { /* ignore */ }
+    window.dispatchEvent(new Event("aria:auth"));
+  },
+};
+
+function updateAuthUI() {
+  const signedIn = Boolean(Session.token);
+  const nameEl = document.getElementById("account-name");
+  nameEl.hidden = !signedIn;
+  nameEl.textContent = signedIn ? `@${Session.username || "you"}` : "";
+  document.getElementById("signin-btn").hidden  = signedIn;
+  document.getElementById("signout-btn").hidden = !signedIn;
+  document.querySelectorAll(".requires-auth").forEach(el => el.classList.toggle("locked", !signedIn));
+}
+
+let authMode = "login";
+
+function setAuthMode(mode) {
+  authMode = mode;
+  document.querySelectorAll(".auth-tab").forEach(t => t.classList.toggle("active", t.dataset.mode === mode));
+  const isReg = mode === "register";
+  document.getElementById("auth-username-field").hidden = !isReg;
+  document.getElementById("auth-title").textContent = isReg ? "Create your ARIA account" : "Sign in to ARIA";
+  document.getElementById("auth-submit").textContent = isReg ? "Create account" : "Sign in";
+  document.getElementById("auth-password").autocomplete = isReg ? "new-password" : "current-password";
+  showAuthError("");
+}
+
+function showAuthError(msg) {
+  const el = document.getElementById("auth-error");
+  el.textContent = msg;
+  el.hidden = !msg;
+}
+
+function openAuth(mode = "login", notice = "") {
+  setAuthMode(mode);
+  if (notice) showAuthError(notice);
+  document.getElementById("auth-overlay").hidden = false;
+  document.getElementById("auth-email").focus();
+}
+
+function closeAuth() {
+  document.getElementById("auth-overlay").hidden = true;
+}
+
+// Called whenever an authenticated request comes back 401.
+function handleExpiredSession(message) {
+  Session.clear();
+  openAuth("login", message || "Your session has expired. Please sign in again.");
+}
+
+async function submitAuth(e) {
+  e.preventDefault();
+  const username = document.getElementById("auth-username").value.trim();
+  const email    = document.getElementById("auth-email").value.trim();
+  const password = document.getElementById("auth-password").value;
+  const submit   = document.getElementById("auth-submit");
+
+  if (!email || !password)            return showAuthError("Email and password are required.");
+  if (authMode === "register") {
+    if (!/^[A-Za-z0-9_.-]{3,50}$/.test(username))
+      return showAuthError("Username must be 3–50 letters, digits, '.', '_' or '-'.");
+    if (password.length < 8)          return showAuthError("Password must be at least 8 characters.");
+  }
+
+  submit.disabled = true;
+  showAuthError("");
+  try {
+    if (authMode === "register") {
+      const res  = await fetch("/register", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ username, email, password }),
+      });
+      const data = await readJSON(res);
+      if (!res.ok || data.error) return showAuthError(data.error || "Registration failed.");
+    }
+    const res  = await fetch("/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email, password }),
+    });
+    const data = await readJSON(res);
+    if (!res.ok || !data.token) return showAuthError(data.error || "Sign-in failed.");
+    Session.save(data.token, data.username);
+    document.getElementById("auth-password").value = "";
+    closeAuth();
+  } catch (err) {
+    showAuthError(`Network error: ${err.message}`);
+  } finally {
+    submit.disabled = false;
+  }
+}
+
+document.addEventListener("DOMContentLoaded", () => {
+  document.getElementById("signin-btn").addEventListener("click", () => openAuth("login"));
+  document.getElementById("signout-btn").addEventListener("click", () => Session.clear());
+  document.getElementById("auth-close").addEventListener("click", closeAuth);
+  document.getElementById("auth-overlay").addEventListener("click", e => {
+    if (e.target.id === "auth-overlay") closeAuth();
+  });
+  document.addEventListener("keydown", e => { if (e.key === "Escape") closeAuth(); });
+  document.querySelectorAll(".auth-tab").forEach(t => t.addEventListener("click", () => setAuthMode(t.dataset.mode)));
+  document.getElementById("auth-form").addEventListener("submit", submitAuth);
+  document.querySelectorAll(".requires-auth").forEach(el => el.addEventListener("click", e => {
+    if (!Session.token) { e.preventDefault(); e.stopPropagation(); openAuth("login", "Sign in to use ARIA chat and tasks."); }
+  }, true));
+  updateAuthUI();
+});
+window.addEventListener("aria:auth", updateAuthUI);
+
 // Weather icon map (OpenWeatherMap icon codes → emoji)
 function weatherEmoji(iconCode) {
   const map = {
@@ -106,6 +242,9 @@ async function loadCrypto() {
     const results = await Promise.all(
       CRYPTO_COINS.map(c => apiFetch(`/api/crypto?symbol=${c}`))
     );
+    // One message instead of four when the whole service is down
+    const errs = new Set(results.map(d => d.error));
+    if (!errs.has(undefined) && errs.size === 1) throw new Error(results[0].error);
     const rows = results.map(d => {
       if (d.error) return errorHTML(d.error);
       const changeClass = d.change_24h >= 0 ? "positive" : "negative";
@@ -202,6 +341,8 @@ async function loadGitHub() {
 
 let chatHistory = [];
 
+function chatReset() { chatHistory = []; }
+
 function appendMessage(role, text) {
   const container = document.getElementById("agent-messages");
   const div = document.createElement("div");
@@ -229,6 +370,7 @@ async function sendMessage() {
   const btn   = document.getElementById("send-btn");
   const text  = input.value.trim();
   if (!text) return;
+  if (!Session.token) { openAuth("login", "Sign in to chat with ARIA."); return; }
 
   input.value = "";
   input.disabled = true;
@@ -238,22 +380,22 @@ async function sendMessage() {
   const thinkingEl = appendMessage("thinking", "ARIA is thinking…");
 
   try {
-    const token = localStorage.getItem("token");
-
     const res = await fetch("/api/agent/chat", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Authorization": `Bearer ${token}`
-    },
-    body: JSON.stringify({message: text,history: chatHistory})
-  });
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${Session.token}`
+      },
+      body: JSON.stringify({ message: text, history: chatHistory })
+    });
 
-    const data = await res.json();
-    console.log("Agent Response:", data);
+    const data = await readJSON(res);
     thinkingEl.remove();
 
-    if (data.error) {
+    if (res.status === 401) {
+      appendMessage("error", data.error || "Please sign in again.");
+      handleExpiredSession(data.error);
+    } else if (data.error) {
     appendMessage("error", data.error);
     } else {
         appendMessage("aria", data.reply);
@@ -320,23 +462,41 @@ document.addEventListener("DOMContentLoaded", () => {
   const addBtn    = document.getElementById("todo-add-btn");
   const clearBtn  = document.getElementById("todo-clear-btn");
   const statsEl   = document.getElementById("todo-stats");
+  const errorEl   = document.getElementById("todo-error");
 
   // Auth header — reads the same token your agent chat uses
   function authHdr() {
-    const token = localStorage.getItem("token");
     return {
       "Content-Type":  "application/json",
-      "Authorization": `Bearer ${token}`,
+      "Authorization": `Bearer ${Session.token}`,
     };
+  }
+
+  function showError(msg) {
+    errorEl.textContent = msg ? `⚠ ${msg}` : "";
+    errorEl.hidden = !msg;
+  }
+
+  // Shared request wrapper: surfaces errors and handles expired sessions.
+  async function request(url, options = {}) {
+    const res  = await fetch(url, { ...options, headers: authHdr() });
+    const data = await readJSON(res);
+    if (res.status === 401) {
+      handleExpiredSession(data.error);
+      throw new Error(data.error || "Please sign in again.");
+    }
+    if (!res.ok || data.error) throw new Error(data.error || `HTTP ${res.status}`);
+    showError("");
+    return data;
   }
 
   // ── Load from server ──────────────────────────────────────────
   async function loadTodos() {
+    if (!Session.token) { todos = []; render(); return; }
     try {
-      const res  = await fetch("/api/todos", { headers: authHdr() });
-      const data = await res.json();
+      const data = await request("/api/todos");
       if (Array.isArray(data)) { todos = data; render(); }
-    } catch (e) { console.error("Todos load error", e); }
+    } catch (e) { showError(e.message); }
   }
   window.loadTodos = loadTodos;
 
@@ -344,7 +504,7 @@ document.addEventListener("DOMContentLoaded", () => {
   function render() {
     // Stats badge
     const pending = todos.filter(t => !t.done).length;
-    statsEl.textContent = pending ? `${pending} left` : "all done ✓";
+    statsEl.textContent = !Session.token ? "" : pending ? `${pending} left` : todos.length ? "all done ✓" : "";
 
     // Apply filter
     const visible = todos.filter(t => {
@@ -358,7 +518,8 @@ document.addEventListener("DOMContentLoaded", () => {
     if (visible.length === 0) {
       const li = document.createElement("li");
       li.className = "todo-empty";
-      li.textContent = filter === "done"    ? "No completed tasks yet."
+      li.textContent = !Session.token       ? "Sign in to keep a personal task list."
+                     : filter === "done"    ? "No completed tasks yet."
                      : filter === "pending" ? "Nothing pending — good work!"
                      : "No tasks yet — add one above.";
       listEl.appendChild(li);
@@ -410,12 +571,10 @@ document.addEventListener("DOMContentLoaded", () => {
     if (!text) { inputEl.focus(); return; }
     addBtn.disabled = true;
     try {
-      const res  = await fetch("/api/todos", {
+      const data = await request("/api/todos", {
         method:  "POST",
-        headers: authHdr(),
         body:    JSON.stringify({ text, priority: priEl.value }),
       });
-      const data = await res.json();
       if (data.id) {
         todos.push({ ...data, created_at: new Date().toISOString() });
         inputEl.value = "";
@@ -423,44 +582,42 @@ document.addEventListener("DOMContentLoaded", () => {
         render();
         inputEl.focus();
       }
-    } catch (e) { console.error("Add todo error", e); }
+    } catch (e) { showError(e.message); }
     finally     { addBtn.disabled = false; }
   }
 
   // ── Toggle done ───────────────────────────────────────────────
   async function toggleDone(id, done) {
     try {
-      const res  = await fetch(`/api/todos/${id}`, {
+      const data = await request(`/api/todos/${id}`, {
         method:  "PATCH",
-        headers: authHdr(),
         body:    JSON.stringify({ done }),
       });
-      const data = await res.json();
       if (data.id) {
         const idx = todos.findIndex(t => t.id === id);
         if (idx !== -1) todos[idx].done = data.done;
-        render();
       }
-    } catch (e) { console.error("Toggle todo error", e); }
+    } catch (e) { showError(e.message); }
+    render();   // re-sync the checkbox with the known state
   }
 
   // ── Delete ────────────────────────────────────────────────────
   async function deleteTodo(id) {
     try {
-      await fetch(`/api/todos/${id}`, { method: "DELETE", headers: authHdr() });
+      await request(`/api/todos/${id}`, { method: "DELETE" });
       todos = todos.filter(t => t.id !== id);
       render();
-    } catch (e) { console.error("Delete todo error", e); }
+    } catch (e) { showError(e.message); }
   }
 
   // ── Clear completed ───────────────────────────────────────────
   async function clearDone() {
     if (!todos.some(t => t.done)) return;
     try {
-      await fetch("/api/todos/clear/done", { method: "DELETE", headers: authHdr() });
+      await request("/api/todos/clear/done", { method: "DELETE" });
       todos = todos.filter(t => !t.done);
       render();
-    } catch (e) { console.error("Clear done error", e); }
+    } catch (e) { showError(e.message); }
   }
 
   // ── Events ────────────────────────────────────────────────────
@@ -477,27 +634,17 @@ document.addEventListener("DOMContentLoaded", () => {
     });
   });
 
-  // ── Boot — wait for token then load ──────────────────────────
-  function tryLoad() {
-    if (localStorage.getItem("token")) {
-      loadTodos();
-    } else {
-      // If the page has a login flow that sets the token after DOMContentLoaded,
-      // retry briefly until it's available
-      let attempts = 0;
-      const poll = setInterval(() => {
-        if (localStorage.getItem("token") || ++attempts > 30) {
-          clearInterval(poll);
-          if (localStorage.getItem("token")) loadTodos();
-        }
-      }, 300);
-    }
-  }
+  // ── Boot — load now, and again whenever the user signs in/out ──
+  window.addEventListener("aria:auth", () => {
+    showError("");
+    if (!Session.token) chatReset();
+    loadTodos();
+  });
 
   if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", tryLoad);
+    document.addEventListener("DOMContentLoaded", loadTodos);
   } else {
-    tryLoad();
+    loadTodos();
   }
 })();
 

@@ -1,6 +1,6 @@
 from sqlalchemy import (Column,Integer,Text,DateTime,Boolean,String,ForeignKey)
 from sqlalchemy.sql import func
-from datetime import datetime
+from datetime import datetime, timezone
 from database import Base
 
 
@@ -53,7 +53,7 @@ class ChatHistory(Base):
 
     created_at = Column(
         DateTime,
-        default=datetime.utcnow
+        default=lambda: datetime.now(timezone.utc).replace(tzinfo=None)
     )
 
 

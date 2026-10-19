@@ -25,3 +25,10 @@ Thumbs.db
 # Logs
 *.log
 uvicorn.log
+
+# Tests / local databases
+tests/test.db
+*.db
+*.sqlite3
+.env.*
+!.env.example
