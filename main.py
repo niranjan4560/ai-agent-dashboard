@@ -1,7 +1,14 @@
 # main.py
 import os
+import re
 import json
+import time
 import asyncio
+import logging
+from collections import defaultdict, deque
+from contextlib import asynccontextmanager
+from pathlib import Path
+
 import httpx
 from google import genai
 from google.genai import types
@@ -12,27 +19,107 @@ from auth import (
     verify_password,
     create_token,
     decode_token,
+    BCRYPT_MAX_BYTES,
 )
-from database import SessionLocal
+from database import SessionLocal, engine, Base
 from models import ChatHistory, User, Todo
-from datetime import datetime
-from fastapi import FastAPI, Request, Depends
+from datetime import datetime, timezone
+from fastapi import FastAPI, Request, Depends, HTTPException
+from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
+from sqlalchemy import text as sql_text
+from sqlalchemy.exc import IntegrityError
 from dotenv import load_dotenv
 
 # ─── Bootstrap ────────────────────────────────────────────────────────────────
 
 load_dotenv()
 
-security = HTTPBearer()
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+log = logging.getLogger("aria")
+# httpx logs full request URLs at INFO — OpenWeather's key is a query parameter.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
-app = FastAPI(title="AI Agent Dashboard")
-app.mount("/static", StaticFiles(directory="static"), name="static")
-templates = Jinja2Templates(directory="templates")
+BASE_DIR = Path(__file__).resolve().parent
+
+security = HTTPBearer(auto_error=False)
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    # Creates missing tables only — never drops or alters existing data.
+    Base.metadata.create_all(bind=engine)
+    log.info("Database tables verified")
+    yield
+
+
+app = FastAPI(title="AI Agent Dashboard", lifespan=lifespan)
+app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
+templates = Jinja2Templates(directory=BASE_DIR / "templates")
+
+# The UI is served by this app, so CORS is only needed for third-party front-ends.
+_cors_origins = [o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()]
+if _cors_origins:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=_cors_origins,
+        allow_methods=["GET", "POST", "PATCH", "DELETE"],
+        allow_headers=["Authorization", "Content-Type"],
+    )
+
+
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    return response
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_error_handler(_request: Request, exc: RequestValidationError):
+    # Flatten pydantic errors into the {"error": "..."} shape the UI expects.
+    first = exc.errors()[0] if exc.errors() else {}
+    field = ".".join(str(p) for p in first.get("loc", [])[1:]) or "request"
+    msg = str(first.get("msg", "Invalid input")).removeprefix("Value error, ")
+    return JSONResponse({"error": f"{field}: {msg}"}, status_code=422)
+
+
+@app.exception_handler(HTTPException)
+async def http_error_handler(_request: Request, exc: HTTPException):
+    return JSONResponse({"error": exc.detail}, status_code=exc.status_code)
+
+
+@app.exception_handler(Exception)
+async def unhandled_error_handler(request: Request, exc: Exception):
+    log.exception("Unhandled error on %s %s", request.method, request.url.path)
+    return JSONResponse({"error": "Internal server error"}, status_code=500)
+
+
+def current_user_id(
+    credentials: HTTPAuthorizationCredentials | None = Depends(security),
+) -> int:
+    """Resolve the bearer token to an existing user's id, or reply 401."""
+    payload = decode_token(credentials.credentials) if credentials else None
+    if not payload or "user_id" not in payload:
+        raise HTTPException(status_code=401, detail="Please sign in again (invalid or expired session).")
+    db = SessionLocal()
+    try:
+        if not db.get(User, payload["user_id"]):
+            raise HTTPException(status_code=401, detail="Account no longer exists. Please sign in again.")
+    finally:
+        db.close()
+    return payload["user_id"]
 
 # ─── Environment Variables ────────────────────────────────────────────────────
 
@@ -42,11 +129,27 @@ GITHUB_USERNAME     = os.getenv("GITHUB_USERNAME", "")
 GITHUB_TOKEN        = os.getenv("GITHUB_TOKEN", "")
 GEMINI_API_KEY      = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL        = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+CHAT_RATE_LIMIT     = int(os.getenv("CHAT_RATE_LIMIT_PER_MINUTE", "10"))
+
+# Per-user sliding window. In-memory, so it is per process — fine for a single
+# free-tier instance; use Redis if you scale out.
+_chat_calls: dict[int, deque] = defaultdict(deque)
+
+
+def _chat_rate_limited(user_id: int) -> bool:
+    now = time.monotonic()
+    calls = _chat_calls[user_id]
+    while calls and now - calls[0] > 60:
+        calls.popleft()
+    if len(calls) >= CHAT_RATE_LIMIT:
+        return True
+    calls.append(now)
+    return False
 
 # Gemini client created lazily — missing key does not crash the app at startup.
 def _get_gemini_client() -> genai.Client:
     if not GEMINI_API_KEY:
-        raise ValueError("GEMINI_API_KEY is not set in your .env file.")
+        raise ValueError("The AI assistant is not configured on this server (GEMINI_API_KEY is missing).")
     return genai.Client(api_key=GEMINI_API_KEY)
 
 # ─── Gemini call with retry ───────────────────────────────────────────────────
@@ -98,7 +201,7 @@ async def _gemini_generate(
             # 400 bad request, 401 invalid key, 403 permission denied — don't retry
             _CLIENT_MESSAGES = {
                 400: "Bad request sent to Gemini. Please rephrase your message.",
-                401: "Invalid Gemini API key. Check GEMINI_API_KEY in your .env file.",
+                401: "The server's Gemini API key is invalid. Please contact the site owner.",
                 403: "Gemini API access denied. Your API key may not have permission for this model.",
                 404: "Gemini model not found. Check the GEMINI_MODEL value in your .env file.",
                 429: "Gemini quota exceeded. You've hit your API rate limit — please wait and retry.",
@@ -111,8 +214,9 @@ async def _gemini_generate(
 
         # ── Anything else (network error, SDK bug, etc.) ──────────────────────
         except Exception as exc:
+            log.exception("Unexpected Gemini error")
             raise ValueError(
-                f"Unexpected error calling Gemini: {type(exc).__name__}: {exc}"
+                f"Could not reach the AI service ({type(exc).__name__}). Please try again."
             ) from exc
 
     # All retries exhausted
@@ -139,7 +243,7 @@ def save_chat(user_id: int, user_message: str, ai_response: str) -> None:
 def add_todo(user_id: int, text: str, priority: str = "medium") -> bool:
     db = SessionLocal()
     try:
-        db.add(Todo(user_id=user_id, text=text, priority=priority))
+        db.add(Todo(user_id=user_id, text=text.strip()[:500], priority=priority))
         db.commit()
         return True
     finally:
@@ -159,6 +263,10 @@ def get_user_todos(user_id: int) -> list:
         db.close()
 
 
+def _escape_like(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 def complete_todo(user_id: int, task_name: str) -> bool:
     db = SessionLocal()
     try:
@@ -166,7 +274,7 @@ def complete_todo(user_id: int, task_name: str) -> bool:
             db.query(Todo)
             .filter(
                 Todo.user_id == user_id,
-                Todo.text.ilike(f"%{task_name}%"),
+                Todo.text.ilike(f"%{_escape_like(task_name)}%", escape="\\"),
                 Todo.done == False,
             )
             .first()
@@ -185,13 +293,11 @@ async def get_weather(city: str = "Kochi") -> dict:
     """Fetch live weather from OpenWeatherMap."""
     if not OPENWEATHER_API_KEY:
         return {"error": "OPENWEATHER_API_KEY not set"}
-    url = (
-        "https://api.openweathermap.org/data/2.5/weather"
-        f"?q={city}&appid={OPENWEATHER_API_KEY}&units=metric"
-    )
+    url = "https://api.openweathermap.org/data/2.5/weather"
+    params = {"q": city, "appid": OPENWEATHER_API_KEY, "units": "metric"}
     try:
         async with httpx.AsyncClient(timeout=10) as c:
-            r = await c.get(url)
+            r = await c.get(url, params=params)
             if r.status_code == 404:
                 return {"error": f"City '{city}' not found"}
             if r.status_code != 200:
@@ -209,6 +315,9 @@ async def get_weather(city: str = "Kochi") -> dict:
             }
     except httpx.TimeoutException:
         return {"error": "Weather API timed out"}
+    except httpx.HTTPError as exc:
+        log.warning("Weather API unreachable: %s", exc)
+        return {"error": "Weather service is unreachable right now"}
 
 
 async def get_news(query: str = "technology", count: int = 5) -> dict:
@@ -216,14 +325,12 @@ async def get_news(query: str = "technology", count: int = 5) -> dict:
     if not NEWS_API_KEY:
         return {"error": "NEWS_API_KEY not set"}
     count = max(1, min(count, 10))
-    url = (
-        "https://newsapi.org/v2/everything"
-        f"?q={query}&sortBy=publishedAt&pageSize={count}"
-        f"&apiKey={NEWS_API_KEY}&language=en"
-    )
+    url = "https://newsapi.org/v2/everything"
+    params = {"q": query, "sortBy": "publishedAt", "pageSize": count, "language": "en"}
+    headers = {"X-Api-Key": NEWS_API_KEY, "User-Agent": "aria-dashboard/1.0"}
     try:
         async with httpx.AsyncClient(timeout=10) as c:
-            r = await c.get(url)
+            r = await c.get(url, params=params, headers=headers)
             if r.status_code != 200:
                 return {"error": f"News API error {r.status_code}"}
             articles = r.json().get("articles", [])
@@ -232,7 +339,7 @@ async def get_news(query: str = "technology", count: int = 5) -> dict:
                 "articles": [
                     {
                         "title":       (a.get("title") or "")[:200],
-                        "source":      a["source"].get("name", "Unknown"),
+                        "source":      (a.get("source") or {}).get("name") or "Unknown",
                         "url":         a.get("url", ""),
                         "published":   (a.get("publishedAt") or "")[:10],
                         "description": (a.get("description") or "")[:120],
@@ -242,18 +349,24 @@ async def get_news(query: str = "technology", count: int = 5) -> dict:
             }
     except httpx.TimeoutException:
         return {"error": "News API timed out"}
+    except httpx.HTTPError as exc:
+        log.warning("News API unreachable: %s", exc)
+        return {"error": "News service is unreachable right now"}
 
 
 async def get_crypto_price(symbol: str = "bitcoin") -> dict:
     """Fetch live crypto price from CoinGecko (no API key needed)."""
     ids = symbol.lower().strip().replace(" ", "-")[:50]
-    url = (
-        "https://api.coingecko.com/api/v3/simple/price"
-        f"?ids={ids}&vs_currencies=usd&include_24hr_change=true&include_market_cap=true"
-    )
+    url = "https://api.coingecko.com/api/v3/simple/price"
+    params = {
+        "ids": ids, "vs_currencies": "usd",
+        "include_24hr_change": "true", "include_market_cap": "true",
+    }
     try:
         async with httpx.AsyncClient(timeout=10) as c:
-            r = await c.get(url)
+            r = await c.get(url, params=params)
+            if r.status_code == 429:
+                return {"error": "CoinGecko rate limit reached — try again in a minute"}
             if r.status_code != 200:
                 return {"error": f"CoinGecko API error {r.status_code}"}
             data = r.json()
@@ -263,11 +376,14 @@ async def get_crypto_price(symbol: str = "bitcoin") -> dict:
             return {
                 "symbol":     ids,
                 "price_usd":  coin["usd"],
-                "change_24h": round(coin.get("usd_24h_change", 0), 2),
+                "change_24h": round(coin.get("usd_24h_change") or 0, 2),
                 "market_cap": coin.get("usd_market_cap", 0),
             }
     except httpx.TimeoutException:
         return {"error": "CoinGecko API timed out"}
+    except httpx.HTTPError as exc:
+        log.warning("CoinGecko unreachable: %s", exc)
+        return {"error": "Crypto price service is unreachable right now"}
 
 
 async def get_github_activity(username: str = None) -> dict:
@@ -275,15 +391,19 @@ async def get_github_activity(username: str = None) -> dict:
     user = (username or GITHUB_USERNAME or "").strip()
     if not user:
         return {"error": "No GitHub username provided"}
+    if not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})", user):
+        return {"error": f"'{user[:39]}' is not a valid GitHub username"}
     headers = {"Accept": "application/vnd.github+json"}
     if GITHUB_TOKEN:
         headers["Authorization"] = f"Bearer {GITHUB_TOKEN}"
-    url = f"https://api.github.com/users/{user}/events/public?per_page=10"
+    url = f"https://api.github.com/users/{user}/events/public"
     try:
         async with httpx.AsyncClient(timeout=10) as c:
-            r = await c.get(url, headers=headers)
+            r = await c.get(url, headers=headers, params={"per_page": 10})
             if r.status_code == 404:
                 return {"error": f"GitHub user '{user}' not found"}
+            if r.status_code in (403, 429):
+                return {"error": "GitHub rate limit reached — try again later"}
             if r.status_code != 200:
                 return {"error": f"GitHub API error {r.status_code}"}
             events = r.json()
@@ -300,6 +420,9 @@ async def get_github_activity(username: str = None) -> dict:
             }
     except httpx.TimeoutException:
         return {"error": "GitHub API timed out"}
+    except httpx.HTTPError as exc:
+        log.warning("GitHub API unreachable: %s", exc)
+        return {"error": "GitHub is unreachable right now"}
 
 # ─── Tool registry ────────────────────────────────────────────────────────────
 
@@ -454,19 +577,42 @@ async def index(request: Request):
     return templates.TemplateResponse(request, "index.html")
 
 
+@app.get("/healthz")
+def healthz():
+    """Liveness/readiness probe used by the hosting platform."""
+    try:
+        with engine.connect() as conn:
+            conn.execute(sql_text("SELECT 1"))
+        db_ok = True
+    except Exception as exc:
+        log.error("Health check: database unreachable: %s", exc)
+        db_ok = False
+    body = {
+        "status":   "ok" if db_ok else "degraded",
+        "database": "ok" if db_ok else "unreachable",
+        "integrations": {
+            "gemini":      bool(GEMINI_API_KEY),
+            "openweather": bool(OPENWEATHER_API_KEY),
+            "newsapi":     bool(NEWS_API_KEY),
+            "github_token": bool(GITHUB_TOKEN),
+        },
+    }
+    return JSONResponse(body, status_code=200 if db_ok else 503)
+
+
 @app.get("/api/weather")
 async def weather_endpoint(city: str = "Kochi"):
-    return JSONResponse(await get_weather(city.strip()[:100]))
+    return JSONResponse(await get_weather(city.strip()[:100] or "Kochi"))
 
 
 @app.get("/api/news")
 async def news_endpoint(query: str = "technology", count: int = 5):
-    return JSONResponse(await get_news(query.strip()[:100], max(1, min(count, 10))))
+    return JSONResponse(await get_news(query.strip()[:100] or "technology", max(1, min(count, 10))))
 
 
 @app.get("/api/crypto")
 async def crypto_endpoint(symbol: str = "bitcoin"):
-    return JSONResponse(await get_crypto_price(symbol.strip()[:50]))
+    return JSONResponse(await get_crypto_price(symbol.strip()[:50] or "bitcoin"))
 
 
 @app.get("/api/github")
@@ -476,7 +622,7 @@ async def github_endpoint(username: str = ""):
 
 @app.get("/api/time")
 async def time_endpoint():
-    now = datetime.now()
+    now = datetime.now(timezone.utc)
     return {
         "iso":  now.isoformat(),
         "date": now.strftime("%A, %B %d %Y"),
@@ -485,55 +631,113 @@ async def time_endpoint():
 
 # ─── Auth routes ──────────────────────────────────────────────────────────────
 
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+def _clean_email(value: str) -> str:
+    value = value.strip().lower()
+    if len(value) > 200 or not _EMAIL_RE.match(value):
+        raise ValueError("Please enter a valid email address")
+    return value
+
+
 class RegisterRequest(BaseModel):
     username: str
     email: str
     password: str
 
+    @field_validator("username")
+    @classmethod
+    def _username(cls, v: str) -> str:
+        v = v.strip()
+        if not re.fullmatch(r"[A-Za-z0-9_.-]{3,50}", v):
+            raise ValueError("Username must be 3–50 letters, digits, '.', '_' or '-'")
+        return v
+
+    @field_validator("email")
+    @classmethod
+    def _email(cls, v: str) -> str:
+        return _clean_email(v)
+
+    @field_validator("password")
+    @classmethod
+    def _password(cls, v: str) -> str:
+        if len(v) < 8:
+            raise ValueError("Password must be at least 8 characters")
+        if len(v.encode("utf-8")) > BCRYPT_MAX_BYTES:
+            raise ValueError(f"Password must be at most {BCRYPT_MAX_BYTES} bytes")
+        return v
+
 
 class LoginRequest(BaseModel):
     email: str
-    password: str
+    password: str = Field(max_length=200)
+
+    @field_validator("email")
+    @classmethod
+    def _email(cls, v: str) -> str:
+        return v.strip().lower()[:200]
 
 
 @app.post("/register")
-async def register(req: RegisterRequest):
+def register(req: RegisterRequest):
     db = SessionLocal()
     try:
-        if db.query(User).filter(User.email == req.email).first():
-            return {"error": "Email already exists"}
+        if db.query(User).filter(User.email.ilike(_escape_like(req.email), escape="\\")).first():
+            return JSONResponse({"error": "Email already exists"}, status_code=409)
+        if db.query(User).filter(User.username == req.username).first():
+            return JSONResponse({"error": "Username already taken"}, status_code=409)
         db.add(User(
             username=req.username,
             email=req.email,
             password_hash=hash_password(req.password),
         ))
-        db.commit()
+        try:
+            db.commit()
+        except IntegrityError:
+            # Concurrent registration with the same email/username
+            db.rollback()
+            return JSONResponse({"error": "Email or username already exists"}, status_code=409)
+        log.info("New user registered")
         return {"message": "Registration successful"}
     finally:
         db.close()
 
 
 @app.post("/login")
-async def login(req: LoginRequest):
+def login(req: LoginRequest):
     db = SessionLocal()
     try:
-        user = db.query(User).filter(User.email == req.email).first()
+        # Emails were stored as typed before validation was added — match case-insensitively.
+        user = db.query(User).filter(User.email.ilike(_escape_like(req.email), escape="\\")).first()
         if not user or not verify_password(req.password, user.password_hash):
-            return {"error": "Invalid credentials"}
+            return JSONResponse({"error": "Invalid credentials"}, status_code=401)
         token = create_token({"user_id": user.id, "email": user.email})
-        return {"token": token}
+        return {"token": token, "username": user.username}
+    finally:
+        db.close()
+
+
+@app.get("/api/me")
+def me(user_id: int = Depends(current_user_id)):
+    db = SessionLocal()
+    try:
+        user = db.get(User, user_id)
+        return {"id": user.id, "username": user.username, "email": user.email}
     finally:
         db.close()
 
 
 @app.get("/my-chats")
-async def my_chats(user_id: int):
+def my_chats(limit: int = 50, user_id: int = Depends(current_user_id)):
+    # The user is taken from the token — never from a query parameter.
     db = SessionLocal()
     try:
         chats = (
             db.query(ChatHistory)
             .filter(ChatHistory.user_id == user_id)
             .order_by(ChatHistory.created_at.desc())
+            .limit(max(1, min(limit, 200)))
             .all()
         )
         return [
@@ -550,103 +754,95 @@ async def my_chats(user_id: int):
 
 # ─── To-Do REST API ───────────────────────────────────────────────────────────
 
+_PRIORITIES = ("low", "medium", "high")
+
+
 class TodoCreate(BaseModel):
-    text:     str
+    text:     str = Field(max_length=2000)
     priority: str = "medium"
 
 
 class TodoUpdate(BaseModel):
-    text:     str | None = None
+    text:     str | None = Field(default=None, max_length=2000)
     priority: str | None = None
     done:     bool | None = None
 
 
+def _todo_json(t: Todo) -> dict:
+    return {"id": t.id, "text": t.text, "priority": t.priority,
+            "done": t.done, "created_at": t.created_at}
+
+
 @app.get("/api/todos")
-async def get_todos(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    payload = decode_token(credentials.credentials)
-    if not payload:
-        return JSONResponse({"error": "Unauthorised"}, status_code=401)
-    db = SessionLocal()
-    try:
-        todos = (
-            db.query(Todo)
-            .filter(Todo.user_id == payload["user_id"])
-            .order_by(Todo.created_at.asc())
-            .all()
-        )
-        return [
-            {"id": t.id, "text": t.text, "priority": t.priority,
-             "done": t.done, "created_at": t.created_at}
-            for t in todos
-        ]
-    finally:
-        db.close()
+def get_todos(user_id: int = Depends(current_user_id)):
+    return [_todo_json(t) for t in get_user_todos(user_id)]
 
 
 @app.post("/api/todos")
-async def create_todo(
-    req: TodoCreate,
-    credentials: HTTPAuthorizationCredentials = Depends(security),
-):
-    payload = decode_token(credentials.credentials)
-    if not payload:
-        return JSONResponse({"error": "Unauthorised"}, status_code=401)
+def create_todo(req: TodoCreate, user_id: int = Depends(current_user_id)):
     if not req.text.strip():
         return JSONResponse({"error": "Task text cannot be empty"}, status_code=400)
-    priority = req.priority if req.priority in ("low", "medium", "high") else "medium"
+    priority = req.priority if req.priority in _PRIORITIES else "medium"
     db = SessionLocal()
     try:
         todo = Todo(
-            user_id=payload["user_id"],
+            user_id=user_id,
             text=req.text.strip()[:500],
             priority=priority,
         )
         db.add(todo)
         db.commit()
         db.refresh(todo)
-        return {"id": todo.id, "text": todo.text, "priority": todo.priority, "done": todo.done}
+        return _todo_json(todo)
     finally:
         db.close()
 
 
 @app.patch("/api/todos/{todo_id}")
-async def update_todo(
-    todo_id: int,
-    req: TodoUpdate,
-    credentials: HTTPAuthorizationCredentials = Depends(security),
-):
-    payload = decode_token(credentials.credentials)
-    if not payload:
-        return JSONResponse({"error": "Unauthorised"}, status_code=401)
+def update_todo(todo_id: int, req: TodoUpdate, user_id: int = Depends(current_user_id)):
     db = SessionLocal()
     try:
         todo = db.query(Todo).filter(
-            Todo.id == todo_id, Todo.user_id == payload["user_id"]
+            Todo.id == todo_id, Todo.user_id == user_id
         ).first()
         if not todo:
             return JSONResponse({"error": "Task not found"}, status_code=404)
-        if req.text     is not None: todo.text     = req.text.strip()[:500]
-        if req.priority is not None and req.priority in ("low", "medium", "high"):
+        if req.text is not None:
+            if not req.text.strip():
+                return JSONResponse({"error": "Task text cannot be empty"}, status_code=400)
+            todo.text = req.text.strip()[:500]
+        if req.priority is not None and req.priority in _PRIORITIES:
             todo.priority = req.priority
-        if req.done     is not None: todo.done     = req.done
+        if req.done is not None:
+            todo.done = req.done
         db.commit()
-        return {"id": todo.id, "text": todo.text, "priority": todo.priority, "done": todo.done}
+        db.refresh(todo)
+        return _todo_json(todo)
+    finally:
+        db.close()
+
+
+@app.delete("/api/todos/clear/done")
+def clear_done_todos(user_id: int = Depends(current_user_id)):
+    db = SessionLocal()
+    try:
+        deleted = (
+            db.query(Todo)
+            .filter(Todo.user_id == user_id, Todo.done == True)
+            .delete()
+        )
+        db.commit()
+        return {"cleared": deleted}
     finally:
         db.close()
 
 
 @app.delete("/api/todos/{todo_id}")
-async def delete_todo(
-    todo_id: int,
-    credentials: HTTPAuthorizationCredentials = Depends(security),
-):
-    payload = decode_token(credentials.credentials)
-    if not payload:
-        return JSONResponse({"error": "Unauthorised"}, status_code=401)
+def delete_todo(todo_id: int, user_id: int = Depends(current_user_id)):
     db = SessionLocal()
     try:
         todo = db.query(Todo).filter(
-            Todo.id == todo_id, Todo.user_id == payload["user_id"]
+            Todo.id == todo_id, Todo.user_id == user_id
         ).first()
         if not todo:
             return JSONResponse({"error": "Task not found"}, status_code=404)
@@ -656,44 +852,28 @@ async def delete_todo(
     finally:
         db.close()
 
-
-@app.delete("/api/todos/clear/done")
-async def clear_done_todos(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    payload = decode_token(credentials.credentials)
-    if not payload:
-        return JSONResponse({"error": "Unauthorised"}, status_code=401)
-    db = SessionLocal()
-    try:
-        deleted = (
-            db.query(Todo)
-            .filter(Todo.user_id == payload["user_id"], Todo.done == True)
-            .delete()
-        )
-        db.commit()
-        return {"cleared": deleted}
-    finally:
-        db.close()
-
 # ─── AI Agent Chat ────────────────────────────────────────────────────────────
 
 class ChatRequest(BaseModel):
-    message: str
-    history: list = []
+    message: str = Field(max_length=2000)
+    history: list = Field(default_factory=list, max_length=100)
 
 
 @app.post("/api/agent/chat")
 async def agent_chat(
     req: ChatRequest,
-    credentials: HTTPAuthorizationCredentials = Depends(security),
+    user_id: int = Depends(current_user_id),
 ):
-    # Auth runs first — before any business logic
-    payload = decode_token(credentials.credentials)
-    if not payload:
-        return JSONResponse({"error": "Invalid or expired token"}, status_code=401)
-    user_id = payload["user_id"]
-
     msg       = req.message.strip()
     msg_lower = msg.lower()
+    if not msg:
+        return JSONResponse({"error": "Message cannot be empty"}, status_code=400)
+
+    if _chat_rate_limited(user_id):
+        return JSONResponse(
+            {"error": f"You're sending messages too quickly (limit {CHAT_RATE_LIMIT}/minute). Please wait a moment."},
+            status_code=429,
+        )
 
     # ── Shortcut: Add Todo ────────────────────────────────────────────────────
     if msg_lower.startswith("add "):
@@ -735,13 +915,15 @@ async def agent_chat(
     try:
         gemini_client = _get_gemini_client()
     except ValueError as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
+        return JSONResponse({"error": str(e)}, status_code=503)
 
     # Build conversation history as typed Gemini Content objects
     contents: list[types.Content] = []
     for turn in (req.history or [])[-20:]:
+        if not isinstance(turn, dict):
+            continue
         role = turn.get("role", "user")
-        text = turn.get("content", "")
+        text = str(turn.get("content") or "")[:4000]
         if role == "assistant":
             role = "model"
         if role in ("user", "model") and text:
@@ -827,14 +1009,15 @@ async def agent_chat(
         function_response_parts = []
         for part in fn_call_parts:
             fn_name = part.function_call.name
-            fn_args = dict(part.function_call.args)
+            fn_args = dict(part.function_call.args or {})
 
             executor = TOOL_MAP.get(fn_name)
             if executor:
                 try:
                     raw_result = await executor(**fn_args)
                 except Exception as exc:
-                    raw_result = {"error": str(exc)}
+                    log.warning("Tool %s failed: %s", fn_name, exc)
+                    raw_result = {"error": f"{type(exc).__name__}: {exc}"}
             else:
                 raw_result = {"error": f"Unknown tool: {fn_name}"}
 

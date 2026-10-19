@@ -747,3 +747,147 @@ body::before {
 /* ─── Utility ────────────────────────────────────────────────── */
 .mono { font-family: var(--mono); }
 .flex-between { display: flex; justify-content: space-between; align-items: center; }
+
+/* ─── Account / Auth ─────────────────────────────────────────── */
+[hidden] { display: none !important; }
+
+.account { display: flex; align-items: center; gap: 8px; margin-left: 6px; }
+.account-name {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--accent2);
+  max-width: 140px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.account-btn {
+  background: var(--accent);
+  color: #000;
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 700;
+  padding: 5px 10px;
+  cursor: pointer;
+  transition: opacity 0.15s;
+}
+.account-btn:hover { opacity: 0.85; }
+.account-btn--ghost { background: transparent; color: var(--text-dim); border-color: var(--border2); }
+.account-btn--ghost:hover { color: var(--text); }
+
+/* Cards that need an account are dimmed with a hint while signed out */
+.requires-auth { position: relative; }
+.requires-auth.locked > *:not(.card-header) { opacity: 0.35; filter: grayscale(0.6); }
+.requires-auth.locked { cursor: pointer; }
+.requires-auth.locked::after {
+  content: 'Sign in to use';
+  position: absolute;
+  top: 50%; left: 50%;
+  transform: translate(-50%, -50%);
+  font-family: var(--mono);
+  font-size: 12px;
+  letter-spacing: 1px;
+  color: var(--accent);
+  background: var(--surface2);
+  border: 1px solid var(--accent);
+  border-radius: 8px;
+  padding: 8px 14px;
+  pointer-events: none;
+}
+
+.auth-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(5,6,9,0.75);
+  backdrop-filter: blur(4px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  z-index: 200;
+}
+.auth-modal {
+  position: relative;
+  width: 100%;
+  max-width: 400px;
+  max-height: calc(100vh - 32px);
+  overflow-y: auto;
+  background: var(--surface);
+  border: 1px solid var(--border2);
+  border-radius: var(--radius-lg);
+  padding: 24px;
+}
+.auth-close {
+  position: absolute;
+  top: 10px; right: 12px;
+  background: none;
+  border: none;
+  color: var(--text-dim);
+  font-size: 22px;
+  cursor: pointer;
+}
+.auth-close:hover { color: var(--text); }
+.auth-tabs { display: flex; gap: 6px; margin-bottom: 16px; }
+.auth-tab {
+  flex: 1;
+  background: var(--bg);
+  border: 1px solid var(--border2);
+  border-radius: 6px;
+  color: var(--text-dim);
+  font-family: var(--mono);
+  font-size: 11px;
+  padding: 7px 8px;
+  cursor: pointer;
+}
+.auth-tab.active { color: var(--accent); border-color: var(--accent); }
+.auth-title { font-size: 18px; font-weight: 600; margin-bottom: 14px; }
+.auth-field { display: flex; flex-direction: column; gap: 4px; margin-bottom: 12px; }
+.auth-field span { font-family: var(--mono); font-size: 10px; letter-spacing: 1.5px; color: var(--text-dim); text-transform: uppercase; }
+.auth-field input {
+  background: var(--bg);
+  border: 1px solid var(--border2);
+  border-radius: 8px;
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 16px;   /* ≥16px stops iOS zooming on focus */
+  padding: 9px 12px;
+  outline: none;
+}
+.auth-field input:focus { border-color: var(--accent); }
+.auth-error,
+.todo-error {
+  color: var(--accent3);
+  font-size: 12px;
+  font-family: var(--mono);
+  padding: 8px 10px;
+  background: rgba(255,95,126,0.07);
+  border: 1px solid rgba(255,95,126,0.2);
+  border-radius: 8px;
+  margin-bottom: 12px;
+}
+.todo-error { margin: 8px 16px 12px; }
+.auth-submit {
+  width: 100%;
+  background: var(--accent);
+  border: none;
+  border-radius: 8px;
+  color: #000;
+  font-weight: 600;
+  font-size: 14px;
+  padding: 10px;
+  cursor: pointer;
+}
+.auth-submit:disabled { opacity: 0.6; cursor: wait; }
+.auth-note { margin-top: 14px; font-size: 11px; line-height: 1.5; color: var(--text-dim); }
+
+/* ─── Small screens ──────────────────────────────────────────── */
+@media (max-width: 680px) {
+  .topbar { padding: 10px 16px; gap: 8px; }
+  .topbar-center, .logo-sub, .status-dot { display: none; }
+  .live-time { font-size: 12px; letter-spacing: 1px; }
+  .dashboard-grid { padding: 12px 16px 16px; gap: 12px; }
+  .city-input { width: 90px; }
+  .account-name { max-width: 80px; }
+}
